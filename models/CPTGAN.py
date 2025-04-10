@@ -156,6 +156,115 @@ class CLIP_Mapper(nn.Module):
         return x.permute(1, 0, 2)[:, 1:, :].permute(0, 2, 1).reshape(-1, 768, grid, grid).contiguous().type(img.dtype)
 
 
+class DilateAttention(nn.Module):
+
+    def __init__(self, head_dim, qk_scale=None,  kernel_size=3, dilation=1):
+        super().__init__()
+        self.head_dim = head_dim
+        self.scale = qk_scale or head_dim ** -0.5
+        self.kernel_size = kernel_size
+        self.unfold = nn.Unfold(kernel_size, dilation, dilation * (kernel_size - 1) // 2, 1)
+
+
+    def forward(self, q, k, v):
+
+        #B, C//3, H, W
+        B,d,H,W = q.shape
+        q = q.reshape([B, d//self.head_dim, self.head_dim, 1 ,H*W]).permute(0, 1, 4, 3, 2)  # B,h,N,1,d
+        k = self.unfold(k).reshape([B, d//self.head_dim, self.head_dim, self.kernel_size*self.kernel_size, H*W]).permute(0, 1, 4, 2, 3)  #B,h,N,d,k*k
+        attn = (q @ k) * self.scale  # B,h,N,1,k*k
+        attn = attn.softmax(dim=-1)
+
+        v = self.unfold(v).reshape([B, d//self.head_dim, self.head_dim, self.kernel_size*self.kernel_size, H*W]).permute(0, 1, 4, 3, 2)  # B,h,N,k*k,d
+        x = (attn @ v).transpose(1, 2).reshape(B, H, W, d)
+
+        return x
+
+class MultiDilatelocalAttention(nn.Module):
+
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None,
+                  kernel_size=3, dilation=[1, 2, 3, 4]):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.dilation = dilation
+        self.kernel_size = kernel_size
+        self.scale = qk_scale or head_dim ** -0.5
+        self.num_dilation = len(dilation)
+        assert num_heads % self.num_dilation == 0, f"num_heads {num_heads} must be a multiple of num_dilation {self.num_dilation}!!"
+        self.qkv = nn.Conv2d(dim, dim * 3, 1, bias=qkv_bias)
+        self.dilate_attention = nn.ModuleList(
+            [DilateAttention(head_dim, qk_scale, kernel_size, dilation[i])
+             for i in range(self.num_dilation)])
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x):
+
+        B, H, W, C = x.shape
+
+        x = x.permute(0, 3, 1, 2)# B, C, H, W
+
+        qkv = self.qkv(x).reshape(B, 3, self.num_dilation, C//self.num_dilation, H, W).permute(2, 1, 0, 3, 4, 5)
+        #num_dilation,3,B,C//num_dilation,H,W
+        x = x.reshape(B, self.num_dilation, C//self.num_dilation, H, W).permute(1, 0, 3, 4, 2 )
+        # num_dilation, B, H, W, C//num_dilation
+        for i in range(self.num_dilation):
+            x[i] = self.dilate_attention[i](qkv[i][0], qkv[i][1], qkv[i][2])# B, H, W,C//num_dilation
+        x = x.permute(1, 2, 3, 0, 4).reshape(B, H, W, C)
+
+        x = self.proj(x)
+        return x
+
+
+class DilateBlock(nn.Module):
+    "Implementation of Dilate-attention block"
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False,qk_scale=None,
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, kernel_size=3, dilation=[1, 2, 3, 4]):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.mlp_ratio = mlp_ratio
+        self.kernel_size = kernel_size
+        self.dilation = dilation
+
+
+        self.norm1 = norm_layer(dim)
+        self.attn = MultiDilatelocalAttention(dim, num_heads)
+
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim,
+                       act_layer=act_layer)
+
+    def forward(self, x):
+
+        x = x.permute(0, 2, 3, 1)
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        x = x.permute(0, 3, 1, 2)
+        return x
+
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+        return x
+
+
+
+
+
 
 
 
@@ -166,13 +275,17 @@ class CLIP_Adapter(nn.Module):
         self.CLIP_ch = CLIP_ch
 
 
+        # self.FBlocks = nn.ModuleList([])
+        # self.FBlocks.append(M_Block(in_ch, mid_ch, out_ch, cond_dim, k, s, p))
+        # for i in range(map_num - 1):
+        #     self.FBlocks.append(M_Block(out_ch, mid_ch, out_ch, cond_dim, k, s, p))
         self.FBlock1 = M_Block(in_ch, mid_ch, out_ch, cond_dim, k, s, p)
         self.FBlock2 = M_Block(out_ch, mid_ch, out_ch, cond_dim, k, s, p)
         self.FBlock3 = M_Block(out_ch, mid_ch, out_ch, cond_dim, k, s, p)
         self.FBlock4 = M_Block(out_ch, mid_ch, out_ch, cond_dim, k, s, p)
 
         self.attn = DilateBlock(64, 4)
-
+        #self.cross_attn = CrossAttentionBlock(64, 512)
 
         self.conv_fuse = nn.Conv2d(out_ch, CLIP_ch, 5, 1, 2)
         self.CLIP_ViT = CLIP_Mapper(CLIP)
@@ -183,6 +296,15 @@ class CLIP_Adapter(nn.Module):
     def forward(self, out, c):
 
         prompts = self.fc_prompt(c).view(c.size(0), -1, self.CLIP_ch)
+        # for FBlock in self.FBlocks:
+        #     out = FBlock(out, c)
+            # torch.Size([64, 64, 7, 7])
+            # torch.Size([64, 64, 7, 7])
+            # torch.Size([64, 64, 7, 7])
+            # torch.Size([64, 64, 7, 7])
+            # torch.Size([64, 64, 7, 7])
+            # torch.Size([64, 64, 7, 7])
+            # torch.Size([64, 64, 7, 7])
             # torch.Size([64, 64, 7, 7])
         out = self.FBlock1(out, c)
 
@@ -234,12 +356,7 @@ class NetG(nn.Module):
             # fuse text and visual features
             # torch.Size([64, 512, 7, 7])
             for GBlock in self.GBlocks:
-                out = GBlock(out, cond)          # torch.Size([64, 512, 7, 7])
-                                                            # torch.Size([64, 512, 8, 8])
-                                                            # torch.Size([64, 512, 16, 16])
-                                                            # torch.Size([64, 512, 32, 32])
-                                                            # torch.Size([64, 256, 64, 64])
-                                                            # torch.Size([64, 128, 128, 128])
+                out = GBlock(out, cond)
             # convert to RGB image
             out = self.to_rgb(out)
         return out
@@ -289,9 +406,9 @@ class M_Block(nn.Module):
     def __init__(self, in_ch, mid_ch, out_ch, cond_dim, k, s, p):
         super(z, self).__init__()
         self.conv1 = nn.Conv2d(in_ch, mid_ch, k, s, p)
-        self.fuse1 = DFBLK_CAdaIN(cond_dim, mid_ch)
+        self.fuse1 = DFBLK_AdaIN(cond_dim, mid_ch)
         self.conv2 = nn.Conv2d(mid_ch, out_ch, k, s, p)
-        self.fuse2 = DFBLK_CAdaIN(cond_dim, out_ch)
+        self.fuse2 = DFBLK_AdaIN(cond_dim, out_ch)
         self.learnable_sc = in_ch != out_ch
         self.sru = SRU(in_ch)
         if self.learnable_sc:
@@ -392,9 +509,9 @@ class DFBLK(nn.Module):
         return h
 
 
-class DFBLK_CAdaIN(nn.Module):
+class DFBLK_AdaIN(nn.Module):
     def __init__(self, cond_dim, in_ch):
-        super(DFBLK_CAdaIN, self).__init__()
+        super(DFBLK_AdaIN, self).__init__()
         self.affine0 = CAdaIN(cond_dim, in_ch)
         self.affine1 = CAdaIN(cond_dim, in_ch)
 
@@ -466,6 +583,47 @@ class SRU(nn.Module):
         return torch.cat([x_11 + x_22, x_12 + x_21], dim=1)
 
 
+
+class CAdaIN(nn.Module):
+    def __init__(self, cond_dim, num_features):
+        super(CAdaIN, self).__init__()
+
+        self.fc_gamma = nn.Sequential(OrderedDict([
+            ('linear1',nn.Linear(cond_dim, num_features)),
+            ('relu1',nn.ReLU(inplace=True)),
+            ('linear2',nn.Linear(num_features, num_features)),
+        ]))
+        self.fc_beta = nn.Sequential(OrderedDict([
+            ('linear1',nn.Linear(cond_dim, num_features)),
+            ('relu1',nn.ReLU(inplace=True)),
+            ('linear2',nn.Linear(num_features, num_features)),
+        ]))
+        self._initialize()
+
+    def _initialize(self):
+        nn.init.zeros_(self.fc_gamma.linear2.weight.data)
+        nn.init.ones_(self.fc_gamma.linear2.bias.data)
+        nn.init.zeros_(self.fc_beta.linear2.weight.data)
+        nn.init.zeros_(self.fc_beta.linear2.bias.data)
+
+    def forward(self, x, y):
+        eps = 1e-5
+        mean, var = torch.mean(x, dim=(2, 3), keepdim=True), torch.var(x, dim=(2, 3), keepdim=True)
+        std = torch.sqrt(var + eps)
+        x_normalized = (x - mean) / std
+
+        weight = self.fc_gamma(y)
+        bias = self.fc_beta(y)
+
+        if weight.dim() == 1:
+            weight = weight.unsqueeze(0)
+        if bias.dim() == 1:
+            bias = bias.unsqueeze(0)
+
+        size = x.size()
+        weight = weight.unsqueeze(-1).unsqueeze(-1).expand(size)
+        bias = bias.unsqueeze(-1).unsqueeze(-1).expand(size)
+        return weight * x_normalized + bias
 
 
 
